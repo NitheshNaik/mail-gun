@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Mini System Design: Bulk Email at Scale
+#
+# Services:
+#   redis   — Message broker (BullMQ queue backend)
+#   api     — Express API server (enqueues jobs, serves status)
+#   worker  — BullMQ email worker (rate-limited, retry-capable)
+#
+# Usage:
+#   docker compose up --build          # Start all services
+#   docker compose up --scale worker=3 # Scale to 3 parallel workers
+#   docker compose logs -f worker      # Tail worker logs
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ───────────────────────────────────────────────────────
+  # Redis — BullMQ message broker
+  # ───────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: email_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes  # enable persistence
+
+  # ───────────────────────────────────────────────────────
+  # API Server — Express (upload-job, status, parse-csv)
+  # ───────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email_api
+    restart: unless-stopped
+    command: node server.js
+    ports:
+      - "3001:3001"
+    environment:
+      PORT:                  3001
+      REDIS_HOST:            redis        # Docker service name resolves via DNS
+      REDIS_PORT:            6379
+      SMTP_HOST:             ${SMTP_HOST}
+      SMTP_PORT:             ${SMTP_PORT}
+      SMTP_SECURE:           ${SMTP_SECURE}
+      SMTP_USER:             ${SMTP_USER}
+      SMTP_PASS:             ${SMTP_PASS}
+      SMTP_FROM_NAME:        ${SMTP_FROM_NAME}
+      BATCH_SIZE:            ${BATCH_SIZE:-5000}
+      DEFAULT_FROM_EMAIL:    ${DEFAULT_FROM_EMAIL}
+      BREVO_USER:            ${BREVO_USER}
+      BREVO_PASS:            ${BREVO_PASS}
+      MAILJET_API_KEY:       ${MAILJET_API_KEY}
+      MAILJET_SECRET_KEY:    ${MAILJET_SECRET_KEY}
+      SENDPULSE_USER:        ${SENDPULSE_USER}
+      SENDPULSE_PASS:        ${SENDPULSE_PASS}
+      SENDER_NET_USER:       ${SENDER_NET_USER}
+      SENDER_NET_PASS:       ${SENDER_NET_PASS}
+      GMAIL_1_USER:          ${GMAIL_1_USER}
+      GMAIL_1_PASS:          ${GMAIL_1_PASS}
+      GMAIL_2_USER:          ${GMAIL_2_USER}
+      GMAIL_2_PASS:          ${GMAIL_2_PASS}
+      OUTLOOK_1_USER:        ${OUTLOOK_1_USER}
+      OUTLOOK_1_PASS:        ${OUTLOOK_1_PASS}
+      OUTLOOK_2_USER:        ${OUTLOOK_2_USER}
+      OUTLOOK_2_PASS:        ${OUTLOOK_2_PASS}
+      MAILGUN_USER:          ${MAILGUN_USER}
+      MAILGUN_PASS:          ${MAILGUN_PASS}
+    volumes:
+      - sqlite_data:/app/email_jobs.db    # Shared SQLite DB (api + worker)
+      - uploads_data:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ───────────────────────────────────────────────────────
+  # Worker — BullMQ email processor
+  # Scale horizontally: docker compose up --scale worker=N
+  # ───────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email_worker
+    restart: unless-stopped
+    command: node worker.js          # Override default CMD
+    environment:
+      REDIS_HOST:            redis
+      REDIS_PORT:            6379
+      SMTP_HOST:             ${SMTP_HOST}
+      SMTP_PORT:             ${SMTP_PORT}
+      SMTP_SECURE:           ${SMTP_SECURE}
+      SMTP_USER:             ${SMTP_USER}
+      SMTP_PASS:             ${SMTP_PASS}
+      SMTP_FROM_NAME:        ${SMTP_FROM_NAME}
+      RATE_LIMIT_PER_SECOND: ${RATE_LIMIT_PER_SECOND:-10}
+      MAX_RETRIES:           ${MAX_RETRIES:-3}
+      WORKER_CONCURRENCY:    ${WORKER_CONCURRENCY:-5}
+      DEFAULT_FROM_EMAIL:    ${DEFAULT_FROM_EMAIL}
+      BREVO_USER:            ${BREVO_USER}
+      BREVO_PASS:            ${BREVO_PASS}
+      MAILJET_API_KEY:       ${MAILJET_API_KEY}
+      MAILJET_SECRET_KEY:    ${MAILJET_SECRET_KEY}
+      SENDPULSE_USER:        ${SENDPULSE_USER}
+      SENDPULSE_PASS:        ${SENDPULSE_PASS}
+      SENDER_NET_USER:       ${SENDER_NET_USER}
+      SENDER_NET_PASS:       ${SENDER_NET_PASS}
+      GMAIL_1_USER:          ${GMAIL_1_USER}
+      GMAIL_1_PASS:          ${GMAIL_1_PASS}
+      GMAIL_2_USER:          ${GMAIL_2_USER}
+      GMAIL_2_PASS:          ${GMAIL_2_PASS}
+      OUTLOOK_1_USER:        ${OUTLOOK_1_USER}
+      OUTLOOK_1_PASS:        ${OUTLOOK_1_PASS}
+      OUTLOOK_2_USER:        ${OUTLOOK_2_USER}
+      OUTLOOK_2_PASS:        ${OUTLOOK_2_PASS}
+      MAILGUN_USER:          ${MAILGUN_USER}
+      MAILGUN_PASS:          ${MAILGUN_PASS}
+    volumes:
+      - sqlite_data:/app/email_jobs.db    # Same SQLite DB volume as api
+    depends_on:
+      redis:
+        condition: service_healthy
+
+# ─────────────────────────────────────────────────────────
+# Named Volumes
+# ─────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+  sqlite_data:
+  uploads_data:

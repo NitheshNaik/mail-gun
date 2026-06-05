@@ -1,0 +1,24 @@
+{
+  "name": "bulk-email-sender-backend",
+  "version": "2.0.0",
+  "description": "Scalable async bulk email backend — BullMQ + Redis + sql.js SQLite",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "worker": "node worker.js",
+    "worker:dev": "node --watch worker.js"
+  },
+  "dependencies": {
+    "bullmq": "^5.7.1",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.3.2",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.13",
+    "uuid": "^10.0.0"
+  }
+}
