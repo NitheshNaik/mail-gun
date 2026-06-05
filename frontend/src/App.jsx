@@ -44,6 +44,9 @@ function App() {
   // ── Controls ──────────────────────────────────────────────────────────────────
   const [controlStatus, setControlStatus] = useState('running');
   const [smtpStats,     setSmtpStats]     = useState(null);
+  const [isPausing,     setIsPausing]     = useState(false);
+  const [isStopping,    setIsStopping]    = useState(false);
+  const [isResuming,    setIsResuming]    = useState(false);
 
   // ── Feedback ─────────────────────────────────────────────────────────────────
   const [error,   setError]   = useState(null);
@@ -67,7 +70,15 @@ function App() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Status fetch failed');
         setJobStatus(data);
-        if (data.controlStatus) setControlStatus(data.controlStatus);
+        if (data.controlStatus) {
+          setControlStatus(data.controlStatus);
+          if (data.controlStatus === 'paused' || data.controlStatus === 'stopped') {
+            stopPolling();
+            if (data.controlStatus === 'stopped') {
+              setJobState('idle');
+            }
+          }
+        }
         if (data.completed) {
           setJobState('completed');
           setSuccess(`All done! ${formatNumber(data.sent)} sent, ${formatNumber(data.failed)} failed out of ${formatNumber(data.total)} total.`);
@@ -97,31 +108,56 @@ function App() {
 
   // ── Job controls ───────────────────────────────────────────────────────────
   const handlePause = async () => {
-    if (!jobId || controlStatus === 'stopped') return;
+    if (!jobId || controlStatus === 'stopped' || controlStatus === 'paused' || isPausing || isStopping || isResuming) return;
+    setIsPausing(true);
     try {
       const res = await fetch(`${API_BASE}/api/jobs/${jobId}/pause`, { method: 'POST' });
       const data = await res.json();
-      if (data.success) setControlStatus('paused');
-    } catch (err) { console.error('[CONTROL] Pause:', err.message); }
+      if (data.success) {
+        setControlStatus('paused');
+      }
+    } catch (err) { 
+      console.error('[CONTROL] Pause:', err.message); 
+    } finally {
+      setIsPausing(false);
+    }
   };
 
   const handleResume = async () => {
-    if (!jobId) return;
+    if (!jobId || controlStatus !== 'paused' || isResuming || isPausing || isStopping) return;
+    setIsResuming(true);
     try {
       const res = await fetch(`${API_BASE}/api/jobs/${jobId}/resume`, { method: 'POST' });
       const data = await res.json();
-      if (data.success) setControlStatus('running');
-    } catch (err) { console.error('[CONTROL] Resume:', err.message); }
+      if (data.success) {
+        setControlStatus('running');
+        setJobState('queued');
+        startPolling(jobId);
+      }
+    } catch (err) { 
+      console.error('[CONTROL] Resume:', err.message); 
+    } finally {
+      setIsResuming(false);
+    }
   };
 
   const handleStop = async () => {
-    if (!jobId || controlStatus === 'stopped') return;
+    if (!jobId || controlStatus === 'stopped' || isStopping || isPausing || isResuming) return;
     if (!window.confirm('Stop this job? Unsent emails will be abandoned.')) return;
+    setIsStopping(true);
     try {
       const res = await fetch(`${API_BASE}/api/jobs/${jobId}/stop`, { method: 'POST' });
       const data = await res.json();
-      if (data.success) { setControlStatus('stopped'); stopPolling(); }
-    } catch (err) { console.error('[CONTROL] Stop:', err.message); }
+      if (data.success) {
+        setControlStatus('stopped');
+        stopPolling();
+        setJobState('idle');
+      }
+    } catch (err) { 
+      console.error('[CONTROL] Stop:', err.message); 
+    } finally {
+      setIsStopping(false);
+    }
   };
 
   // ── File handlers ──────────────────────────────────────────────────────────
@@ -201,7 +237,11 @@ function App() {
     : `Hi ${previewName} [Your message will appear here...]`;
 
   const filteredRows = previewRows.filter(r => filter === 'all' || r.status === filter);
-  const showControls = jobId && progressPct > 0 && progressPct < 100;
+  const showControls = jobId && (
+    (progressPct > 0 && progressPct < 100) ||
+    controlStatus === 'paused' ||
+    controlStatus === 'stopped'
+  );
 
   // ─────────────────────────────────────────────────────────────────────────
   // Render
@@ -349,36 +389,48 @@ function App() {
                   className="ctrl-btn pause-btn"
                   title="Pause"
                   onClick={handlePause}
-                  disabled={!jobId || controlStatus === 'stopped' || controlStatus === 'paused' || !isBusy}
+                  disabled={!jobId || controlStatus === 'stopped' || controlStatus === 'paused' || !isBusy || isPausing || isStopping || isResuming}
                 >
-                  <span className="material-symbols-outlined">pause</span>
+                  {isPausing ? (
+                    <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                  ) : (
+                    <span className="material-symbols-outlined">pause</span>
+                  )}
                 </button>
                 <button
                   className="ctrl-btn resume-btn"
                   title="Resume"
                   onClick={handleResume}
-                  disabled={!jobId || controlStatus !== 'paused'}
+                  disabled={!jobId || controlStatus !== 'paused' || isResuming || isPausing || isStopping}
                 >
-                  <span className="material-symbols-outlined">play_arrow</span>
+                  {isResuming ? (
+                    <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                  ) : (
+                    <span className="material-symbols-outlined">play_arrow</span>
+                  )}
                 </button>
                 <button
                   className="ctrl-btn stop-btn"
                   title="Stop"
                   onClick={handleStop}
-                  disabled={!jobId || controlStatus === 'stopped'}
+                  disabled={!jobId || controlStatus === 'stopped' || isStopping || isPausing || isResuming}
                 >
-                  <span className="material-symbols-outlined">stop</span>
+                  {isStopping ? (
+                    <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                  ) : (
+                    <span className="material-symbols-outlined">stop</span>
+                  )}
                 </button>
               </div>
             </div>
 
             {/* Control status badges */}
             {showControls && (
-              <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+              <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 {jobId && <div className="job-chip"><span className="job-chip-label">Job</span><span className="job-chip-value">{jobId}</span></div>}
-                {controlStatus === 'paused'  && <span className="status-badge badge-paused">⏸ PAUSED</span>}
-                {controlStatus === 'running' && isBusy && <span className="status-badge badge-running poll-dot">● RUNNING</span>}
-                {controlStatus === 'stopped' && <span className="status-badge badge-stopped">■ STOPPED</span>}
+                {controlStatus === 'paused'  && <span className="status-badge badge-paused">⏸ Paused — click Resume to continue</span>}
+                {controlStatus === 'running' && isBusy && !isStopping && !isPausing && <span className="status-badge badge-running poll-dot">● RUNNING</span>}
+                {controlStatus === 'stopped' && <span className="status-badge badge-stopped">■ Stopped</span>}
               </div>
             )}
             {jobId && !showControls && progressPct >= 100 && (
@@ -388,6 +440,17 @@ function App() {
             )}
 
             <div className="monitor-center">
+              {/* While stopping: show an amber banner "Stopping after current email…" */}
+              {isStopping && (
+                <div className="alert" style={{ width: '100%', borderColor: 'var(--tertiary-fixed-dim)', color: 'var(--tertiary-fixed-dim)', background: 'rgba(249, 188, 72, 0.05)', marginBottom: 12, boxSizing: 'border-box' }}>
+                  <strong>NOTICE:</strong> Stopping after current email…
+                </div>
+              )}
+              {isPausing && (
+                <div className="alert" style={{ width: '100%', borderColor: 'var(--tertiary-fixed-dim)', color: 'var(--tertiary-fixed-dim)', background: 'rgba(249, 188, 72, 0.05)', marginBottom: 12, boxSizing: 'border-box' }}>
+                  <strong>NOTICE:</strong> Pausing after current email…
+                </div>
+              )}
               {/* Big pct */}
               <div className="big-pct">
                 <span className="big-pct-value">{progressPct.toFixed(1)}%</span>
@@ -504,16 +567,39 @@ function App() {
 }
 
 // =============================================================================
-// SmtpStatsPanel — SMTP Provider Pool Live Dashboard (unchanged logic)
+// SmtpStatsPanel — SMTP Provider Pool Live Dashboard — Grouped by 4 Clusters
 // =============================================================================
 
+/** Provider names for each group, in order. */
+const GROUP_PROVIDER_NAMES = [
+  ['gmail_1', 'brevo_1', 'mailjet_1'],
+  ['gmail_2', 'brevo_2', 'mailjet_2'],
+  ['gmail_3', 'brevo_3', 'mailjet_3'],
+  ['gmail_4', 'brevo_4', 'mailjet_4'],
+];
+
+/** Per-provider estimated sends/min for the speed indicator. */
+function estimateSendsPerMin(providerName) {
+  const n = (providerName || '').toLowerCase();
+  if (n.includes('gmail'))   return Math.round(60000 / 800);   // ~75/min
+  if (n.includes('brevo'))   return Math.round(60000 / 400);   // ~150/min
+  if (n.includes('mailjet')) return Math.round(60000 / 500);   // ~120/min
+  return 120;
+}
+
 function SmtpStatsPanel({ smtpStats }) {
+  // Track which groups are expanded (default: all open)
+  const [expanded, setExpanded] = React.useState([true, true, true, true]);
+
+  const toggleGroup = (i) =>
+    setExpanded(prev => prev.map((v, idx) => (idx === i ? !v : v)));
+
   if (!smtpStats) {
     return (
       <section className="smtp-section">
         <div className="smtp-section-header">
-          <span className="smtp-section-title">SMTP Provider Cluster (Active Pool)</span>
-          <span className="smtp-lb-badge">LOAD_BALANCING: ACTIVE</span>
+          <span className="smtp-section-title">SMTP Provider Cluster — Parallel Groups</span>
+          <span className="smtp-lb-badge">PARALLEL: 4 GROUPS</span>
         </div>
         <div className="smtp-loading">
           <div className="spinner" />
@@ -524,92 +610,155 @@ function SmtpStatsPanel({ smtpStats }) {
   }
 
   const { stats = [], totalCapacity = 0, totalSentToday = 0, totalRemaining = 0 } = smtpStats;
-  const totalPct = totalCapacity > 0 ? Math.round((totalSentToday / totalCapacity) * 100) : 0;
 
-  // Build pool bar segments
-  const poolSegments = stats.map(s => ({
-    name: s.provider,
-    pct: totalCapacity > 0 ? ((s.sent / totalCapacity) * 100) : 0,
-    color: (s.exhausted || s.pct >= 100) ? 'var(--error)'
-         : s.pct >= 80                   ? 'var(--tertiary-fixed-dim)'
-         :                                  'var(--primary-container)',
-  }));
+  // Index stats by provider name for O(1) lookup
+  const statMap = Object.fromEntries(stats.map(s => [s.provider, s]));
+
+  // Compute aggregate sending speed from active (non-exhausted) providers
+  let totalSpeedPerMin = 0;
+  for (const s of stats) {
+    if (!s.exhausted && s.pct < 100) {
+      totalSpeedPerMin += estimateSendsPerMin(s.provider);
+    }
+  }
+
+  const totalPct = totalCapacity > 0 ? Math.round((totalSentToday / totalCapacity) * 100) : 0;
 
   return (
     <section className="smtp-section">
+      {/* ── Section header ── */}
       <div className="smtp-section-header">
-        <span className="smtp-section-title">SMTP Provider Cluster (Active Pool)</span>
-        <span className="smtp-lb-badge">LOAD_BALANCING: ACTIVE</span>
+        <span className="smtp-section-title">SMTP Provider Cluster — Parallel Groups</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {totalSpeedPerMin > 0 && (
+            <span className="smtp-speed-badge">
+              ⚡ ~{formatNumber(totalSpeedPerMin)} emails/min
+            </span>
+          )}
+          <span className="smtp-lb-badge">PARALLEL: 4 GROUPS</span>
+        </div>
       </div>
 
-      <div className="smtp-scroll">
-        {stats.length === 0 ? (
-          <div className="smtp-loading">
-            <span>No SMTP providers configured. Add credentials to .env to enable rotation.</span>
-          </div>
-        ) : (
-          <table className="smtp-table">
-            <thead className="smtp-table-head">
-              <tr>
-                <th>Provider</th>
-                <th>Status</th>
-                <th>Usage</th>
-                <th style={{ width: '35%' }}>Throughput</th>
-                <th>Load</th>
-              </tr>
-            </thead>
-            <tbody className="smtp-table-body">
-              {stats.map(s => {
-                const isExhausted = s.exhausted || s.pct >= 100;
-                const isWarn      = !isExhausted && s.pct >= 80;
-                const statusClass = isExhausted ? 'status-done' : isWarn ? 'status-warn' : 'status-active';
-                const statusLabel = isExhausted ? 'DONE' : isWarn ? 'LOW_BAL' : 'ACTIVE';
-                const barColor    = isExhausted ? 'var(--outline)'
-                                  : isWarn      ? 'var(--tertiary-fixed-dim)'
-                                  :               'var(--primary-container)';
-                return (
-                  <tr key={s.provider}>
-                    <td><span className="provider-name">{s.provider.toUpperCase()}</span></td>
-                    <td>
-                      <div className={`smtp-status ${statusClass}`}>
-                        <span className="smtp-status-dot" />
-                        <span className="smtp-status-label">{statusLabel}</span>
-                      </div>
-                    </td>
-                    <td>{formatNumber(s.sent)} / {formatNumber(s.limit)}</td>
-                    <td>
-                      <div className="smtp-mini-bar">
-                        <div className="smtp-mini-fill" style={{ width: `${Math.min(s.pct, 100)}%`, background: barColor }} />
-                      </div>
-                    </td>
-                    <td>{s.pct}%</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      {stats.length === 0 ? (
+        <div className="smtp-loading">
+          <span>No SMTP providers configured. Add credentials to .env to enable rotation.</span>
+        </div>
+      ) : (
+        /* ── 4 Collapsible Groups ── */
+        GROUP_PROVIDER_NAMES.map((providerNames, groupIdx) => {
+          const groupNum = groupIdx + 1;
+          const groupStats = providerNames.map(name => statMap[name]).filter(Boolean);
 
-      
+          if (groupStats.length === 0) return null; // group not configured at all
 
-      {/* Total pool summary (below legend) */}
-      <div style={{ display: 'flex', gap: 24, padding: '8px 16px', borderTop: '1px solid var(--outline-variant)', background: 'var(--surface-container)' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 10, color: 'var(--outline)', textTransform: 'uppercase' }}>Daily Capacity</span>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 14, fontWeight: 700, color: 'var(--on-surface)' }}>{formatNumber(totalCapacity)}</span>
+          const groupSent      = groupStats.reduce((s, p) => s + (p.sent ?? 0), 0);
+          const groupLimit     = groupStats.reduce((s, p) => s + (p.limit ?? 0), 0);
+          const groupRemaining = groupStats.reduce((s, p) => s + (p.remaining ?? 0), 0);
+          const allExhausted   = groupStats.every(p => p.exhausted || p.pct >= 100);
+          const anyWarn        = !allExhausted && groupStats.some(p => !p.exhausted && p.pct >= 80);
+          const groupStatus    = allExhausted ? '🔴' : anyWarn ? '🟡' : '🟢';
+
+          const isOpen = expanded[groupIdx];
+
+          return (
+            <div key={groupNum}>
+              {/* Group header — click to collapse/expand */}
+              <div
+                className="smtp-group-header"
+                onClick={() => toggleGroup(groupIdx)}
+                role="button"
+                aria-expanded={isOpen}
+              >
+                <span className={`smtp-group-toggle${isOpen ? ' open' : ''}`}>▶</span>
+                <span className="smtp-group-name">Group {groupNum}</span>
+                <span className="smtp-group-meta">
+                  <span>Sent: {formatNumber(groupSent)} / {formatNumber(groupLimit)}</span>
+                  <span>Remaining: {formatNumber(groupRemaining)}</span>
+                </span>
+                <span className="smtp-group-status">{groupStatus}</span>
+              </div>
+
+              {/* Group body — collapsible */}
+              <div className={`smtp-group-body ${isOpen ? 'expanded' : 'collapsed'}`}>
+                <table className="smtp-table">
+                  <thead className="smtp-table-head">
+                    <tr>
+                      <th>Provider</th>
+                      <th>Status</th>
+                      <th>Usage</th>
+                      <th style={{ width: '35%' }}>Progress</th>
+                      <th>Load</th>
+                    </tr>
+                  </thead>
+                  <tbody className="smtp-table-body">
+                    {groupStats.map(s => {
+                      const isExhausted = s.exhausted || s.pct >= 100;
+                      const isWarn      = !isExhausted && s.pct >= 80;
+                      const statusClass = isExhausted ? 'status-done' : isWarn ? 'status-warn' : 'status-active';
+                      const statusLabel = isExhausted ? 'DONE' : isWarn ? 'LOW_BAL' : 'ACTIVE';
+                      // Exhausted → outline bar; warn → amber; active → brand primary
+                      const barColor    = isExhausted ? 'var(--outline)'
+                                        : isWarn      ? 'var(--tertiary-fixed-dim)'
+                                        :               'var(--color-primary)';
+                      return (
+                        <tr
+                          key={s.provider}
+                          className={isExhausted ? 'provider-row-exhausted' : ''}
+                        >
+                          <td><span className="provider-name">{s.provider.toUpperCase()}</span></td>
+                          <td>
+                            <div className={`smtp-status ${statusClass}`}>
+                              <span className="smtp-status-dot" />
+                              <span className="smtp-status-label">{statusLabel}</span>
+                            </div>
+                          </td>
+                          <td>{formatNumber(s.sent)} / {formatNumber(s.limit)}</td>
+                          <td>
+                            <div className="smtp-mini-bar">
+                              <div
+                                className="smtp-mini-fill"
+                                style={{ width: `${Math.min(s.pct, 100)}%`, background: barColor }}
+                              />
+                            </div>
+                          </td>
+                          <td>{s.pct}%</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })
+      )}
+
+      {/* ── Total pool summary footer ── */}
+      <div className="smtp-summary-row">
+        <div className="smtp-summary-cell">
+          <span className="smtp-summary-label">Daily Capacity</span>
+          <span className="smtp-summary-value">{formatNumber(totalCapacity)}</span>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 10, color: 'var(--outline)', textTransform: 'uppercase' }}>Sent Today</span>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 14, fontWeight: 700, color: 'var(--tertiary-fixed-dim)' }}>{formatNumber(totalSentToday)}</span>
+        <div className="smtp-summary-cell">
+          <span className="smtp-summary-label">Sent Today</span>
+          <span className="smtp-summary-value" style={{ color: 'var(--tertiary-fixed-dim)' }}>
+            {formatNumber(totalSentToday)}
+          </span>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 10, color: 'var(--outline)', textTransform: 'uppercase' }}>Remaining</span>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 14, fontWeight: 700, color: 'var(--primary)' }}>{formatNumber(totalRemaining)}</span>
+        <div className="smtp-summary-cell">
+          <span className="smtp-summary-label">Remaining</span>
+          <span className="smtp-summary-value" style={{ color: 'var(--color-primary)' }}>
+            {formatNumber(totalRemaining)}
+          </span>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginLeft: 'auto' }}>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 10, color: 'var(--outline)', textTransform: 'uppercase' }}>Pool Usage</span>
-          <span style={{ fontFamily: 'var(--font-code)', fontSize: 14, fontWeight: 700, color: totalPct >= 80 ? 'var(--error)' : 'var(--on-surface)' }}>{totalPct}%</span>
+        <div className="smtp-summary-cell">
+          <span className="smtp-summary-label">Pool Usage</span>
+          <span
+            className="smtp-summary-value"
+            style={{ color: totalPct >= 80 ? 'var(--error)' : 'var(--on-surface)' }}
+          >
+            {totalPct}%
+          </span>
         </div>
       </div>
     </section>

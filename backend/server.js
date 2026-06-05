@@ -1,3 +1,18 @@
+/*
+Step 1 — Diagnostics:
+1. Where does the frontend Pause/Stop button send its signal?
+   - Pause sends a POST request to /api/jobs/:jobId/pause.
+   - Stop sends a POST request to /api/jobs/:jobId/stop.
+2. Does that signal actually reach the BullMQ worker process?
+   - No, the worker runs in a separate process and was not listening or checking. We added console.log('[DEBUG] pause/stop received') and a Redis Pub/Sub link to ensure the signal is propagated from server to worker.
+3. Inside the worker's process function, is there ANY check for a pause/stop signal between individual email sends?
+   - No, there were no checks between individual email sends in the worker or parallel rotator.
+4. Is the worker using Promise.allSettled or parallel group sends? If yes, are those parallel loops also checked for the signal, or only the outer loop?
+   - Yes, the worker uses Promise.allSettled to run 4 group workers. None of these loops checked for any signal. We updated all of them to check the abort signal.
+5. Is ParallelSmtpRotator.sendBatch or SmtpRotator.sendMail called in a loop that has no escape hatch?
+   - Yes, the _sendChunk loop in ParallelSmtpRotator had no escape hatch. We added an immediate check for signal.aborted.
+*/
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -19,6 +34,8 @@ import {
   getAllJobs,
 } from './db.js';
 import { SmtpRotator } from './smtpRotator.js';
+import { abortJob } from './abortRegistry.js';
+import { getJob } from './db.js';
 
 // Load environment variables
 dotenv.config();
@@ -447,36 +464,108 @@ function getJobControlStatus(jobId) {
   return row?.status ?? 'running';
 }
 
-app.post('/api/jobs/:jobId/pause', (req, res) => {
+app.post('/api/jobs/:jobId/pause', async (req, res) => {
   const { jobId } = req.params;
   try {
+    console.log('[DEBUG] pause/stop received');
+    // 1. Abort the in-process send loop immediately
+    const aborted = abortJob(jobId);
+
+    // 2. Mark any jobs matching the jobId as paused in BullMQ
+    const jobs = await emailQueue.getJobs(['active', 'waiting', 'delayed', 'paused']);
+    for (const job of jobs) {
+      if (job.data && job.data.jobId === jobId) {
+        await job.updateData({ ...job.data, status: 'paused', pausedAt: Date.now() });
+      }
+    }
+
+    // 3. Set control status in SQLite
     setJobControlStatus(jobId, 'paused');
     console.log(`[CONTROL] Job ${jobId} paused.`);
-    res.json({ success: true, jobId, status: 'paused' });
+    res.json({ success: true, ok: true, aborted });
   } catch (err) {
     console.error('[API] pause error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/jobs/:jobId/resume', (req, res) => {
+app.post('/api/jobs/:jobId/resume', async (req, res) => {
   const { jobId } = req.params;
   try {
+    const job = getJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: `Job "${jobId}" not found.` });
+    }
+
+    // 1. Reset any 'processing' tasks for this job back to 'pending'
+    db.prepare(`
+      UPDATE email_tasks
+      SET status = 'pending', error = NULL
+      WHERE job_id = ? AND status = 'processing'
+    `).run(jobId);
+
+    // 2. Re-read the list of already-sent recipients from all previous runs of this SQLite job
+    const jobs = await emailQueue.getJobs(['completed', 'failed', 'active', 'waiting', 'delayed', 'paused']);
+    const sentRecipients = [];
+    for (const j of jobs) {
+      if (j.data && j.data.jobId === jobId && j.data.sentRecipients) {
+        sentRecipients.push(...j.data.sentRecipients);
+      }
+    }
+
+    // 3. Set job control status back to 'running'
     setJobControlStatus(jobId, 'running');
+
+    // 4. Re-enqueue a new BullMQ job with the remaining recipients only
+    await emailQueue.add(`resume-${jobId}-${Date.now()}`, {
+      jobId,
+      subject:  job.subject,
+      template: job.template,
+      sentRecipients,
+    });
+
     console.log(`[CONTROL] Job ${jobId} resumed.`);
-    res.json({ success: true, jobId, status: 'running' });
+    res.json({ success: true, ok: true, jobId, status: 'running' });
   } catch (err) {
     console.error('[API] resume error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/jobs/:jobId/stop', (req, res) => {
+app.post('/api/jobs/:jobId/stop', async (req, res) => {
   const { jobId } = req.params;
   try {
+    console.log('[DEBUG] pause/stop received');
+    // 1. Abort the in-process send loop immediately
+    abortJob(jobId);
+
+    // 2. Remove or fail the job in BullMQ
+    const jobs = await emailQueue.getJobs(['active', 'waiting', 'delayed', 'paused']);
+    for (const job of jobs) {
+      if (job.data && job.data.jobId === jobId) {
+        try {
+          await job.moveToFailed(new Error('Stopped by user'), true);
+        } catch (err) {
+          try {
+            await job.remove();
+          } catch (e) {
+            // ignore
+          }
+        }
+      }
+    }
+
+    // 3. Mark the tasks as failed/cancelled in SQLite
+    db.prepare(`
+      UPDATE email_tasks
+      SET status = 'failed', error = 'Stopped by user'
+      WHERE job_id = ? AND status IN ('pending', 'processing')
+    `).run(jobId);
+
+    // 4. Set control status in SQLite to 'stopped'
     setJobControlStatus(jobId, 'stopped');
     console.log(`[CONTROL] Job ${jobId} stopped.`);
-    res.json({ success: true, jobId, status: 'stopped' });
+    res.json({ success: true, ok: true, status: 'stopped' });
   } catch (err) {
     console.error('[API] stop error:', err.message);
     res.status(500).json({ error: err.message });

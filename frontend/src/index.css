@@ -2,7 +2,20 @@
 
 /* ── Design Tokens ────────────────────────────────────────────────────── */
 :root {
-  /* Surface palette */
+  /* ── Brand Colour Palette ─────────────────────────────────────────── */
+  --color-primary:   #FF6B00;   /* CTAs, active states, badges, progress, links */
+  --color-secondary: #F2F2F2;   /* Card backgrounds, input backgrounds, sidebar  */
+  --color-tertiary:  #1A1A1A;   /* Primary text, headings, icon fills             */
+  --color-neutral:   #FFFFFF;   /* Page background, modal background, table rows  */
+
+  /* ── Spacing Scale ────────────────────────────────────────────────── */
+  --space-xs: 8px;
+  --space-sm: 16px;
+  --space-md: 24px;
+  --space-lg: 40px;
+  --space-xl: 64px;
+
+  /* Surface palette (dark terminal theme) */
   --bg:                  #0a0a0f;
   --surface:             #0d1513;
   --surface-dim:         #0d1513;
@@ -12,7 +25,7 @@
   --surface-highest:     #2e3634;
   --surface-variant:     #2e3634;
 
-  /* Primary (teal/mint) */
+  /* Primary (teal/mint) — terminal accent kept for non-brand UI elements */
   --primary:             #71ffe8;
   --primary-fixed:       #41fce2;
   --primary-fixed-dim:   #00dfc6;
@@ -72,7 +85,7 @@ body {
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: #1e1e2e; }
-::-webkit-scrollbar-thumb:hover { background: var(--primary-container); }
+::-webkit-scrollbar-thumb:hover { background: var(--color-primary); }
 
 /* ── Material Symbols ─────────────────────────────────────────────────── */
 .material-symbols-outlined {

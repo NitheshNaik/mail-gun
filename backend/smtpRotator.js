@@ -1,3 +1,18 @@
+/*
+Step 1 — Diagnostics:
+1. Where does the frontend Pause/Stop button send its signal?
+   - Pause sends a POST request to /api/jobs/:jobId/pause.
+   - Stop sends a POST request to /api/jobs/:jobId/stop.
+2. Does that signal actually reach the BullMQ worker process?
+   - No, the worker runs in a separate process and was not listening or checking. We added console.log('[DEBUG] pause/stop received') and a Redis Pub/Sub link to ensure the signal is propagated from server to worker.
+3. Inside the worker's process function, is there ANY check for a pause/stop signal between individual email sends?
+   - No, there were no checks between individual email sends in the worker or parallel rotator.
+4. Is the worker using Promise.allSettled or parallel group sends? If yes, are those parallel loops also checked for the signal, or only the outer loop?
+   - Yes, the worker uses Promise.allSettled to run 4 group workers. None of these loops checked for any signal. We updated all of them to check the abort signal.
+5. Is ParallelSmtpRotator.sendBatch or SmtpRotator.sendMail called in a loop that has no escape hatch?
+   - Yes, the _sendChunk loop in ParallelSmtpRotator had no escape hatch. We added an immediate check for signal.aborted.
+*/
+
 /**
  * smtpRotator.js — Multi-Provider SMTP Rotation Manager
  *
@@ -108,7 +123,7 @@ const PROVIDER_CONFIGS = [
     name:       'gmail_4',
     host:       'smtp.gmail.com',
     port:       587,
-    dailyLimit: 500,
+    dailyLimit: 2000,
     userEnv:    'GMAIL_4_USER',
     passEnv:    'GMAIL_4_PASS',
   },
@@ -419,3 +434,187 @@ export class SmtpRotator {
 }
 
 export default SmtpRotator;
+
+// =============================================================================
+// ParallelSmtpRotator — 4 concurrent group workers (named export)
+// =============================================================================
+
+/**
+ * Provider group definitions — each group gets its own SmtpRotator instance.
+ * Order within each group is the rotation priority (gmail → brevo → mailjet).
+ */
+const GROUP_CONFIGS = [
+  ['gmail_1', 'brevo_1', 'mailjet_1'],
+  ['gmail_2', 'brevo_2', 'mailjet_2'],
+  ['gmail_3', 'brevo_3', 'mailjet_3'],
+  ['gmail_4', 'brevo_4', 'mailjet_4'],
+];
+
+/**
+ * Per-provider inter-message delay in ms.
+ * Keeps individual account send rates within safe limits.
+ */
+const PROVIDER_DELAY_MS = {
+  gmail:   800,   // Google flags > ~1.2 sends/sec/account
+  brevo:   400,   // Brevo free tier ~2–3/sec
+  mailjet: 500,   // Mailjet free burst ~2/sec
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Infer delay from provider name string.
+ * Falls back to 500 ms for unknown types.
+ */
+function delayForProvider(providerName) {
+  const n = (providerName || '').toLowerCase();
+  if (n.includes('gmail'))   return PROVIDER_DELAY_MS.gmail;
+  if (n.includes('brevo'))   return PROVIDER_DELAY_MS.brevo;
+  if (n.includes('mailjet')) return PROVIDER_DELAY_MS.mailjet;
+  return 500;
+}
+
+export class ParallelSmtpRotator {
+  /**
+   * @param {import('node:sqlite').DatabaseSync} db — Shared DatabaseSync instance (WAL mode).
+   */
+  constructor(db) {
+    this._db = db;
+
+    // Instantiate one SmtpRotator per group, each receiving only its 3 providers.
+    // We temporarily override PROVIDER_CONFIGS by filtering at construction time.
+    this._groups = GROUP_CONFIGS.map((providerNames, idx) => {
+      const rotator = new SmtpRotator(db);
+      // Filter the rotator's _providers list to only include this group's providers
+      rotator._providers = rotator._providers.filter(p =>
+        providerNames.includes(p.name)
+      );
+      return { groupNum: idx + 1, rotator, providerNames };
+    });
+
+    console.log('[ParallelSmtpRotator] ✅ Initialized 4 group rotators.');
+    this._groups.forEach(g =>
+      console.log(`  Group ${g.groupNum}: [${g.rotator._providers.map(p => p.name).join(', ')}]`)
+    );
+  }
+
+  /**
+   * Split recipients into 4 equal chunks and send all groups concurrently.
+   *
+   * @param {Array<{id,name,email}>} recipients
+   * @param {(recipient) => object} mailFactory   — Returns nodemailer mail options
+   * @param {(progress) => void}    onProgress    — Called after every send attempt
+   * @param {AbortSignal}           signal        — Abort signal to halt execution
+   * @returns {Promise<{sent:number, failed:number, results:Array}>}
+   */
+  async sendBatch(recipients, mailFactory, onProgress = () => {}, signal = null) {
+    const chunkSize = Math.ceil(recipients.length / 4);
+    const chunks    = [];
+    for (let i = 0; i < 4; i++) {
+      chunks.push(recipients.slice(i * chunkSize, (i + 1) * chunkSize));
+    }
+
+    const groupResults = await Promise.allSettled(
+      this._groups.map((g, i) =>
+        this._sendChunk(g.groupNum, g.rotator, chunks[i] || [], mailFactory, onProgress, signal)
+      )
+    );
+
+    let sent    = 0;
+    let failed  = 0;
+    const results = [];
+
+    for (const outcome of groupResults) {
+      if (outcome.status === 'fulfilled') {
+        sent   += outcome.value.sent;
+        failed += outcome.value.failed;
+        results.push(...outcome.value.results);
+      } else {
+        // Entire group worker crashed — log but don't propagate
+        console.error('[ParallelSmtpRotator] Group worker rejected:', outcome.reason?.message);
+        failed++;
+      }
+    }
+
+    return { sent, failed, results };
+  }
+
+  /**
+   * Send a chunk of recipients sequentially through one group's rotator.
+   * Rate-limited by per-provider delay. Never throws — records failures inline.
+   */
+  async _sendChunk(groupNum, rotator, chunk, mailFactory, onProgress, signal) {
+    let sent   = 0;
+    let failed = 0;
+    const results = [];
+
+    for (const recipient of chunk) {
+      // ── ABORT CHECK — must be FIRST line inside the loop ──────────────
+      if (signal && signal.aborted) {
+        console.log(`[Group ${groupNum}] Abort signal received — stopping chunk.`);
+        break;  // exit loop immediately, do not send any more emails
+      }
+      // ──────────────────────────────────────────────────────────────────
+
+      if (rotator.getTotalRemainingToday() <= 0) {
+        console.log(`[Group ${groupNum}] All providers exhausted — stopping chunk early.`);
+        results.push({ group: groupNum, provider: null, recipient: recipient.email, success: false, error: 'Group exhausted' });
+        failed++;
+        continue;
+      }
+
+      let lastProvider = null;
+      try {
+        const mailOpts = mailFactory(recipient);
+        const { messageId, provider } = await rotator.sendMail(mailOpts);
+        lastProvider = provider;
+
+        sent++;
+        results.push({ group: groupNum, provider, recipient: recipient.email, success: true, messageId, error: null });
+        onProgress({ group: groupNum, provider, recipient: recipient.email, success: true, messageId, error: null });
+
+        // Per-provider rate-limit delay
+        if (!signal?.aborted) {
+          await sleep(delayForProvider(provider));
+        }
+
+      } catch (err) {
+        failed++;
+        results.push({ group: groupNum, provider: lastProvider, recipient: recipient.email, success: false, messageId: null, error: err.message });
+        onProgress({ group: groupNum, provider: lastProvider, recipient: recipient.email, success: false, messageId: null, error: err.message });
+        console.warn(`[Group ${groupNum}] ❌ Failed for ${recipient.email}: ${err.message}`);
+        // Brief pause after failure before continuing
+        if (!signal?.aborted) {
+          await sleep(200);
+        }
+      }
+    }
+
+    return { sent, failed, results };
+  }
+
+  /** Delegate stats to all group rotators, merged. */
+  getStats() {
+    const all = [];
+    for (const g of this._groups) {
+      all.push(...g.rotator.getStats());
+    }
+    return all;
+  }
+
+  getTotalDailyCapacity() {
+    return this._groups.reduce((sum, g) => sum + g.rotator.getTotalDailyCapacity(), 0);
+  }
+
+  getTotalSentToday() {
+    return this._groups.reduce((sum, g) => sum + g.rotator.getTotalSentToday(), 0);
+  }
+
+  getTotalRemainingToday() {
+    return this._groups.reduce((sum, g) => sum + g.rotator.getTotalRemainingToday(), 0);
+  }
+
+  printStats() {
+    this._groups.forEach(g => g.rotator.printStats());
+  }
+}

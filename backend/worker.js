@@ -1,3 +1,18 @@
+/*
+Step 1 — Diagnostics:
+1. Where does the frontend Pause/Stop button send its signal?
+   - Pause sends a POST request to /api/jobs/:jobId/pause.
+   - Stop sends a POST request to /api/jobs/:jobId/stop.
+2. Does that signal actually reach the BullMQ worker process?
+   - No, the worker runs in a separate process and was not listening or checking. We added console.log('[DEBUG] pause/stop received') and a Redis Pub/Sub link to ensure the signal is propagated from server to worker.
+3. Inside the worker's process function, is there ANY check for a pause/stop signal between individual email sends?
+   - No, there were no checks between individual email sends in the worker or parallel rotator.
+4. Is the worker using Promise.allSettled or parallel group sends? If yes, are those parallel loops also checked for the signal, or only the outer loop?
+   - Yes, the worker uses Promise.allSettled to run 4 group workers. None of these loops checked for any signal. We updated all of them to check the abort signal.
+5. Is ParallelSmtpRotator.sendBatch or SmtpRotator.sendMail called in a loop that has no escape hatch?
+   - Yes, the _sendChunk loop in ParallelSmtpRotator had no escape hatch. We added an immediate check for signal.aborted.
+*/
+
 /**
  * worker.js — BullMQ Email Worker
  *
@@ -5,16 +20,17 @@
  *
  * Responsibilities:
  *  1. Pull email batch jobs from the BullMQ "email-queue" queue
- *  2. Rate-limit sends to RATE_LIMIT_PER_SECOND (configurable)
- *  3. Send each email via Nodemailer with exponential backoff (up to MAX_RETRIES)
+ *  2. Split recipients across 4 provider groups, each running in parallel
+ *  3. Per-provider rate-limit delays: Gmail 800ms, Brevo 400ms, Mailjet 500ms
  *  4. Update SQLite state: pending → processing → sent | failed
  *  5. Never load all 800K rows into memory — only processes the batch it receives
  */
 
 import { Worker } from 'bullmq';
-import { SmtpRotator } from './smtpRotator.js';
+import { SmtpRotator, ParallelSmtpRotator } from './smtpRotator.js';
 import dotenv from 'dotenv';
 import Redis from 'ioredis';
+import { registerJob, cleanupJob } from './abortRegistry.js';
 import {
   initDb,
   getDb,
@@ -22,7 +38,6 @@ import {
   markTaskProcessing,
   markTaskSent,
   markTaskFailed,
-  incrementAttempt,
 } from './db.js';
 
 dotenv.config();
@@ -33,20 +48,18 @@ dotenv.config();
 
 const REDIS_HOST          = process.env.REDIS_HOST          || '127.0.0.1';
 const REDIS_PORT          = parseInt(process.env.REDIS_PORT  || '6379', 10);
-const RATE_LIMIT_PER_SEC  = parseInt(process.env.RATE_LIMIT_PER_SECOND || '5', 10);
+const RATE_LIMIT_PER_SEC  = parseInt(process.env.RATE_LIMIT_PER_SECOND || '5', 10); // informational only — actual throttle is per-provider delay in ParallelSmtpRotator
 const MAX_RETRIES         = parseInt(process.env.MAX_RETRIES  || '3', 10);
-const WORKER_CONCURRENCY  = parseInt(process.env.WORKER_CONCURRENCY || '5', 10);
-
-// Interval in ms between each email send to honour the rate limit
-const SEND_INTERVAL_MS = Math.floor(1000 / RATE_LIMIT_PER_SEC);
+// Each BullMQ job itself runs 4 internal parallel group workers, so keep concurrency low
+const WORKER_CONCURRENCY  = parseInt(process.env.WORKER_CONCURRENCY || '2', 10);
 
 console.log('╔══════════════════════════════════════════════╗');
 console.log('║       Bulk Email Worker — Starting Up        ║');
 console.log('╠══════════════════════════════════════════════╣');
 console.log(`║  Redis         : ${REDIS_HOST}:${REDIS_PORT}`);
-console.log(`║  Rate limit    : ${RATE_LIMIT_PER_SEC} emails/sec (${SEND_INTERVAL_MS}ms gap)`);
+console.log(`║  Rate limit    : Per-provider delays (Gmail 800ms / Brevo 400ms / Mailjet 500ms)`);
 console.log(`║  Max retries   : ${MAX_RETRIES}`);
-console.log(`║  Concurrency   : ${WORKER_CONCURRENCY} batch jobs in parallel`);
+console.log(`║  Concurrency   : ${WORKER_CONCURRENCY} batch jobs × 4 parallel groups each`);
 console.log('╚══════════════════════════════════════════════╝\n');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,7 +94,7 @@ console.log('[DB] ✅ SQLite initialized and connected to disk.');
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. SMTP Rotator — Multi-provider pool
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('[SMTP] Initializing multi-provider SMTP rotator...');
+console.log('[SMTP] Initializing parallel SMTP group rotator (4 groups × 3 providers)...');
 const db = getDb();
 
 // Ensure job_control table exists (worker may start before API server)
@@ -92,8 +105,9 @@ db.exec(`
   )
 `);
 
-const rotator = new SmtpRotator(db);
-rotator.printStats(); // show capacity on startup
+// ParallelSmtpRotator — 4 group workers run concurrently per batch job
+const parallelRotator = new ParallelSmtpRotator(db);
+parallelRotator.printStats(); // show capacity on startup
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -103,6 +117,25 @@ rotator.printStats(); // show capacity on startup
  * Sleep for a given number of milliseconds.
  */
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Build a mailFactory function for a given subject/template.
+ * Returns a function that takes a recipient and returns nodemailer mail options.
+ */
+function buildMailFactory(subject, template) {
+  const fromName = process.env.SMTP_FROM_NAME || 'Bulk Mailer';
+  const fromEmail = process.env.DEFAULT_FROM_EMAIL || process.env.SMTP_USER;
+  return (recipient) => {
+    const name = capitalizeName(recipient.name);
+    const body = `Hi ${name} ${template.trim()}`;
+    return {
+      from:    `"${fromName}" <${fromEmail}>`,
+      to:      recipient.email,
+      subject: subject,
+      html:    body,
+    };
+  };
+}
 
 /**
  * Capitalize each word in a name string.
@@ -115,45 +148,6 @@ function capitalizeName(name) {
     .join(' ');
 }
 
-/**
- * Send one email via the SMTP rotator with exponential backoff retry.
- */
-async function sendWithRetry(task, subject, template) {
-  const { id: taskId, name, email } = task;
-  const capitalizedName = capitalizeName(name);
-  const body = `Hi ${capitalizedName} ${template.trim()}`;
-  const fromName = process.env.SMTP_FROM_NAME || 'Bulk Mailer';
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      incrementAttempt(taskId);
-
-      const { messageId, provider } = await rotator.sendMail({
-        from:    `"${fromName}" <${process.env.DEFAULT_FROM_EMAIL || process.env.SMTP_USER}>`,
-        to:      email,
-        subject: subject,
-        html:    body,
-      });
-
-      return { success: true, provider };
-
-    } catch (err) {
-      const isLastAttempt = attempt === MAX_RETRIES;
-      const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
-
-      console.warn(
-        `[RETRY] Task ${taskId} | ${email} | Attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`
-      );
-
-      if (isLastAttempt) {
-        return { success: false, error: err.message };
-      }
-
-      console.log(`[RETRY] Backing off for ${backoffMs}ms before attempt ${attempt + 1}...`);
-      await sleep(backoffMs);
-    }
-  }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BullMQ Worker — processes one job = one batch of email tasks
@@ -171,97 +165,117 @@ const worker = new Worker(
     console.log(`[JOB] Subject:                  "${subject}"`);
     console.log(`==================================================`);
 
-    // ── Task 2 Change 5: Check total SMTP capacity before starting ──────────
-    if (rotator.getTotalRemainingToday() <= 0) {
+    // Check total SMTP capacity before starting
+    if (parallelRotator.getTotalRemainingToday() <= 0) {
       throw new Error('All SMTP providers exhausted for today. Job will retry tomorrow.');
     }
 
-    // ── Task 4: Upsert 'running' status for this job into job_control ────────
+    // Upsert 'running' status for this job into job_control
     db.prepare(`
       INSERT INTO job_control (job_id, status) VALUES (?, 'running')
       ON CONFLICT(job_id) DO UPDATE SET status = 'running'
     `).run(jobId);
 
-    // Fetch only PENDING tasks for this job (safely re-reads the updated SQLite file)
-    const tasks = getPendingTasks(jobId);
+    // Fetch only PENDING tasks for this job
+    let tasks = getPendingTasks(jobId);
+
+    // Filter out already-sent recipients from sentRecipients in job.data
+    const sentRecipients = job.data.sentRecipients || [];
+    const sentRecipientsSet = new Set(sentRecipients);
+    tasks = tasks.filter(t => !sentRecipientsSet.has(t.email));
 
     if (tasks.length === 0) {
       console.log(`[JOB] ⚠️ No pending tasks found in SQLite for jobId: ${jobId}. Skipping.`);
       return { processed: 0 };
     }
 
-    console.log(`[JOB] Found ${tasks.length} pending email tasks to dispatch.`);
+    // Check for stop/pause before starting
+    const controlPre = db.prepare(`SELECT status FROM job_control WHERE job_id = ?`).get(jobId);
+    if (controlPre?.status === 'stopped') {
+      console.log(`[Worker] Job ${jobId} was stopped before starting.`);
+      return { sent: 0, failed: 0, stopped: true };
+    }
 
-    let sentCount   = 0;
-    let failedCount = 0;
-    let stopped     = false;
-
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
-
-      // ── Task 4: Pause / Stop control check ─────────────────────────────────
-      const control = db.prepare(
-        `SELECT status FROM job_control WHERE job_id = ?`
-      ).get(jobId);
-
-      if (control?.status === 'stopped') {
-        console.log(`[Worker] Job ${jobId} was stopped. Halting.`);
-        stopped = true;
-        break; // exit the for loop, do not send remaining emails
-      }
-
-      if (control?.status === 'paused') {
-        console.log(`[Worker] Job ${jobId} is paused. Waiting...`);
-        // Poll every 3 seconds until resumed or stopped
-        while (true) {
-          await new Promise(r => setTimeout(r, 3000));
-          const recheck = db.prepare(
-            `SELECT status FROM job_control WHERE job_id = ?`
-          ).get(jobId);
-          if (recheck?.status === 'running') break;
-          if (recheck?.status === 'stopped') {
-            console.log(`[Worker] Job ${jobId} stopped while paused.`);
-            return { sent: sentCount, failed: failedCount, stopped: true };
-          }
-        }
-        console.log(`[Worker] Job ${jobId} resumed.`);
-      }
-      // ───────────────────────────────────────────────────────────────────────
-
-      // Mark as processing (so a server/worker restart skips it)
-      markTaskProcessing(task.id);
-
-      console.log(`[SENDING ${i + 1}/${tasks.length}] ${task.email} (Name: ${task.name || 'N/A'})...`);
-      const result = await sendWithRetry(task, subject, template);
-
-      if (result.success) {
-        markTaskSent(task.id);
-        sentCount++;
-        // Show usage stats after send (constraint #9)
-        const stats = rotator.getStats();
-        const provStat = stats.find(s => s.provider === result.provider);
-        console.log(`[Worker] ✅ ${task.email} → via ${result.provider} (${provStat?.sent ?? '?'}/${provStat?.limit ?? '?'} today)`);
-      } else {
-        markTaskFailed(task.id, result.error);
-        failedCount++;
-        console.log(`[FAILURE] ❌ Failed for ${task.email} — Error: ${result.error}`);
-      }
-
-      // Rate limiting: honour the send interval between emails
-      if (i < tasks.length - 1) {
-        await sleep(SEND_INTERVAL_MS);
+    // If paused, wait until resumed or stopped
+    if (controlPre?.status === 'paused') {
+      console.log(`[Worker] Job ${jobId} is paused before start. Waiting...`);
+      while (true) {
+        await sleep(3000);
+        const recheck = db.prepare(`SELECT status FROM job_control WHERE job_id = ?`).get(jobId);
+        if (recheck?.status === 'running') break;
+        if (recheck?.status === 'stopped') return { sent: 0, failed: 0, stopped: true };
       }
     }
 
-    // ── Task 2 Change 4: Print stats after each batch completes ─────────────
-    rotator.printStats();
+    // Register job with AbortController registry
+    const controller = registerJob(jobId);
+    const { signal } = controller;
 
-    console.log(`\n==================================================`);
-    console.log(`[JOB] Finished batch ${job.id}${stopped ? ' (stopped by user)' : ''}`);
-    console.log(`[JOB] Summary - Total: ${tasks.length}, Sent: ${sentCount}, Failed: ${failedCount}`);
-    console.log(`==================================================\n`);
+    try {
+      console.log(`[JOB] Found ${tasks.length} pending email tasks — dispatching across 4 parallel groups.`);
 
-    return { sent: sentCount, failed: failedCount };
+      // Mark all tasks as processing
+      for (const task of tasks) {
+        markTaskProcessing(task.id);
+      }
+
+      // Build the mail factory function
+      const mailFactory = buildMailFactory(subject, template);
+
+      // Track per-recipient task IDs (by email address, keyed for fast lookup)
+      const taskByEmail = Object.fromEntries(tasks.map(t => [t.email, t]));
+
+      // onProgress callback — wired to BullMQ job progress reporting
+      let sentCount   = 0;
+      let failedCount = 0;
+      const onProgress = (progress) => {
+        const task = taskByEmail[progress.recipient];
+        if (!task) return;
+
+        if (progress.success) {
+          markTaskSent(task.id);
+          sentCount++;
+          
+          // Append to sentRecipients array and update job data
+          sentRecipients.push(progress.recipient);
+          job.updateData({
+            ...job.data,
+            sentRecipients
+          }).catch(() => {});
+
+          console.log(`[Worker] ✅ ${progress.recipient} → via ${progress.provider} (Group ${progress.group})`);
+        } else {
+          markTaskFailed(task.id, progress.error || 'Unknown error');
+          failedCount++;
+          console.log(`[Worker] ❌ ${progress.recipient} — ${progress.error}`);
+        }
+
+        // Update BullMQ job progress (total done / total tasks)
+        const totalDone = sentCount + failedCount;
+        const pct = tasks.length > 0 ? Math.round((totalDone / tasks.length) * 100) : 0;
+        job.updateProgress(pct).catch(() => {}); // fire-and-forget
+      };
+
+      // ── Parallel send across 4 groups ────────────────────────────────────────
+      const { sent, failed, results } = await parallelRotator.sendBatch(
+        tasks,
+        mailFactory,
+        onProgress,
+        signal,
+      );
+
+      // Print stats after batch completes
+      parallelRotator.printStats();
+
+      console.log(`\n==================================================`);
+      console.log(`[JOB] Finished batch ${job.id}`);
+      console.log(`[JOB] Summary - Total: ${tasks.length}, Sent: ${sent}, Failed: ${failed}`);
+      console.log(`==================================================\n`);
+
+      return { sent, failed };
+    } finally {
+      cleanupJob(jobId);
+    }
   },
   {
     connection: {
