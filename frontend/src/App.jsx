@@ -290,7 +290,7 @@ function App() {
                 id="subject-input"
                 type="text"
                 className="form-input"
-                placeholder="Enter campaign subject..."
+                placeholder="Enter subject..."
                 value={subject}
                 onChange={e => setSubject(e.target.value)}
                 maxLength={150}
@@ -316,7 +316,7 @@ function App() {
             <div className="form-group">
               <div className="preview-box">
                 <div className="preview-meta">
-                  <span>Sending to: {firstRecipient ? firstRecipient.email : 'example@domain.com'}</span>
+                  <span>To: {firstRecipient ? firstRecipient.email : 'example@domain.com'}</span>
                   <span>LIVE PREVIEW</span>
                 </div>
                 <div className="preview-body">{previewBody}</div>
@@ -591,26 +591,7 @@ function SmtpStatsPanel({ smtpStats }) {
         )}
       </div>
 
-      {/* Pool contribution footer */}
-      <div className="smtp-pool-footer">
-        <span className="pool-footer-label">POOL_CONTRIBUTION:</span>
-        <div className="pool-bar">
-          {poolSegments.map(seg => (
-            <div key={seg.name} className="pool-bar-seg" style={{ width: `${seg.pct}%`, background: seg.color }} />
-          ))}
-        </div>
-        <div className="pool-legend">
-          {stats.slice(0, 4).map((s, i) => {
-            const colors = ['var(--primary-container)', 'var(--primary-fixed)', 'var(--on-primary-fixed-variant)', 'var(--tertiary-fixed-dim)'];
-            return (
-              <div key={s.provider} className="legend-item">
-                <div className="legend-dot" style={{ background: colors[i] || 'var(--outline)' }} />
-                <span className="legend-lbl">{s.provider.toUpperCase().slice(0, 4)}</span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
+      
 
       {/* Total pool summary (below legend) */}
       <div style={{ display: 'flex', gap: 24, padding: '8px 16px', borderTop: '1px solid var(--outline-variant)', background: 'var(--surface-container)' }}>

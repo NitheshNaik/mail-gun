@@ -6,6 +6,14 @@
  * counters at midnight, and falls back to the next provider on
  * permanent auth errors.
  *
+ * Provider layout (priority order):
+ *   Group 1: gmail_1 → brevo_1 → mailjet_1
+ *   Group 2: gmail_2 → brevo_2 → mailjet_2
+ *   Group 3: gmail_3 → brevo_3 → mailjet_3
+ *   Group 4: gmail_4 → brevo_4 → mailjet_4
+ *
+ * Total max daily capacity: 4 × (500 + 300 + 200) = 4,000 emails/day
+ *
  * IMPORTANT: Uses ES module syntax (import/export) — consistent with
  * the rest of the backend (package.json "type": "module").
  */
@@ -17,6 +25,7 @@ import nodemailer from 'nodemailer';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PROVIDER_CONFIGS = [
+  // ── Group 1 ───────────────────────────────────────────
   {
     name:       'gmail_1',
     host:       'smtp.gmail.com',
@@ -26,37 +35,23 @@ const PROVIDER_CONFIGS = [
     passEnv:    'GMAIL_1_PASS',
   },
   {
-    name:       'brevo',
+    name:       'brevo_1',
     host:       'smtp-relay.brevo.com',
     port:       587,
     dailyLimit: 300,
-    userEnv:    'BREVO_USER',
-    passEnv:    'BREVO_PASS',
+    userEnv:    'BREVO_1_USER',
+    passEnv:    'BREVO_1_PASS',
   },
   {
-    name:       'mailjet',
+    name:       'mailjet_1',
     host:       'in-v3.mailjet.com',
     port:       587,
     dailyLimit: 200,
-    userEnv:    'MAILJET_API_KEY',
-    passEnv:    'MAILJET_SECRET_KEY',
+    userEnv:    'MAILJET_1_API_KEY',
+    passEnv:    'MAILJET_1_SECRET_KEY',
   },
-  {
-    name:       'sendpulse',
-    host:       'smtp-pulse.com',
-    port:       587,
-    dailyLimit: 400,
-    userEnv:    'SENDPULSE_USER',
-    passEnv:    'SENDPULSE_PASS',
-  },
-  {
-    name:       'sender_net',
-    host:       'smtp.sender.net',
-    port:       587,
-    dailyLimit: 500,
-    userEnv:    'SENDER_NET_USER',
-    passEnv:    'SENDER_NET_PASS',
-  },
+
+  // ── Group 2 ───────────────────────────────────────────
   {
     name:       'gmail_2',
     host:       'smtp.gmail.com',
@@ -66,28 +61,72 @@ const PROVIDER_CONFIGS = [
     passEnv:    'GMAIL_2_PASS',
   },
   {
-    name:       'outlook_1',
-    host:       'smtp-mail.outlook.com',
+    name:       'brevo_2',
+    host:       'smtp-relay.brevo.com',
     port:       587,
     dailyLimit: 300,
-    userEnv:    'OUTLOOK_1_USER',
-    passEnv:    'OUTLOOK_1_PASS',
+    userEnv:    'BREVO_2_USER',
+    passEnv:    'BREVO_2_PASS',
   },
   {
-    name:       'outlook_2',
-    host:       'smtp-mail.outlook.com',
+    name:       'mailjet_2',
+    host:       'in-v3.mailjet.com',
+    port:       587,
+    dailyLimit: 200,
+    userEnv:    'MAILJET_2_API_KEY',
+    passEnv:    'MAILJET_2_SECRET_KEY',
+  },
+
+  // ── Group 3 ───────────────────────────────────────────
+  {
+    name:       'gmail_3',
+    host:       'smtp.gmail.com',
+    port:       587,
+    dailyLimit: 500,
+    userEnv:    'GMAIL_3_USER',
+    passEnv:    'GMAIL_3_PASS',
+  },
+  {
+    name:       'brevo_3',
+    host:       'smtp-relay.brevo.com',
     port:       587,
     dailyLimit: 300,
-    userEnv:    'OUTLOOK_2_USER',
-    passEnv:    'OUTLOOK_2_PASS',
+    userEnv:    'BREVO_3_USER',
+    passEnv:    'BREVO_3_PASS',
   },
   {
-    name:       'mailgun',
-    host:       'smtp.mailgun.org',
+    name:       'mailjet_3',
+    host:       'in-v3.mailjet.com',
     port:       587,
-    dailyLimit: 1000,
-    userEnv:    'MAILGUN_USER',
-    passEnv:    'MAILGUN_PASS',
+    dailyLimit: 200,
+    userEnv:    'MAILJET_3_API_KEY',
+    passEnv:    'MAILJET_3_SECRET_KEY',
+  },
+
+  // ── Group 4 ───────────────────────────────────────────
+  {
+    name:       'gmail_4',
+    host:       'smtp.gmail.com',
+    port:       587,
+    dailyLimit: 500,
+    userEnv:    'GMAIL_4_USER',
+    passEnv:    'GMAIL_4_PASS',
+  },
+  {
+    name:       'brevo_4',
+    host:       'smtp-relay.brevo.com',
+    port:       587,
+    dailyLimit: 300,
+    userEnv:    'BREVO_4_USER',
+    passEnv:    'BREVO_4_PASS',
+  },
+  {
+    name:       'mailjet_4',
+    host:       'in-v3.mailjet.com',
+    port:       587,
+    dailyLimit: 200,
+    userEnv:    'MAILJET_4_API_KEY',
+    passEnv:    'MAILJET_4_SECRET_KEY',
   },
 ];
 
@@ -111,11 +150,9 @@ const PERMANENT_ERROR_KEYWORDS = [
  * (mark it exhausted and move on — do NOT retry on this provider).
  */
 function isPermanentError(err) {
-  // Check numeric SMTP response code
   if (err.responseCode && PERMANENT_ERROR_CODES.has(err.responseCode)) return true;
   if (err.code        && PERMANENT_ERROR_CODES.has(Number(err.code)))  return true;
 
-  // Check error message text
   const msg = (err.message || '').toLowerCase();
   return PERMANENT_ERROR_KEYWORDS.some(kw => msg.includes(kw));
 }
@@ -213,7 +250,6 @@ export class SmtpRotator {
       const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
       if (row.reset_date !== today) {
         this._resetProvider(provider.name, provider.dailyLimit);
-        // Re-fetch after reset
         const freshRow = this._getUsageRow(provider.name);
         if (!freshRow || freshRow.sent_today >= freshRow.daily_limit) continue;
       } else {
@@ -235,11 +271,9 @@ export class SmtpRotator {
         if (isPermanentError(err)) {
           console.error(`[SmtpRotator] ❌ Permanent error on ${provider.name}: ${err.message}. Marking exhausted.`);
           provider.exhausted = true;
-          // Mark as fully used in DB so it also appears exhausted to the API
           this._db.prepare(`
             UPDATE smtp_usage SET sent_today = daily_limit WHERE provider_name = ?
           `).run(provider.name);
-          // Try next provider
           continue;
         }
         // Transient error — re-throw so caller can retry
@@ -339,17 +373,9 @@ export class SmtpRotator {
       WHERE provider_name = ?
     `).run(providerName);
 
-    // Also un-exhaust in-memory flag if it was set due to quota (not auth error)
+    // Un-exhaust in-memory flag (quota-based exhaustion only — auth errors re-exhaust on next send)
     const provider = this._providers.find(p => p.name === providerName);
-    if (provider && !isPermanentError({ message: '' })) {
-      // Only un-exhaust quota-based exhaustion, not auth-error exhaustion
-      // Check: if the row was exhausted due to quota (not auth), reset the flag
-      // We track auth-exhausted separately via the provider.exhausted flag which
-      // is only set on a permanent auth error — daily quota reset should un-exhaust it
-      // if the exhaustion was quota-based (i.e., not an auth error)
-      // For simplicity: always reset — if auth errors recur they'll re-exhaust
-      provider.exhausted = false;
-    }
+    if (provider) provider.exhausted = false;
   }
 
   /** Reset all providers whose reset_date is not today. */
@@ -368,8 +394,8 @@ export class SmtpRotator {
    * resets all counters. Re-schedules itself for the day after.
    */
   _scheduleMidnightReset() {
-    const now        = new Date();
-    const tomorrow   = new Date(now);
+    const now      = new Date();
+    const tomorrow = new Date(now);
     tomorrow.setDate(tomorrow.getDate() + 1);
     tomorrow.setHours(0, 0, 5, 0);         // 00:00:05 to clear any clock drift
     const msUntilMidnight = tomorrow - now;
@@ -377,11 +403,9 @@ export class SmtpRotator {
     this._midnightTimer = setTimeout(() => {
       console.log('[SmtpRotator] 🔄 Midnight reached — resetting all provider daily counters.');
       this._resetAllCounters();
-      // Re-schedule for the following midnight
       this._scheduleMidnightReset();
     }, msUntilMidnight);
 
-    // Allow Node.js to exit even if this timer is pending
     if (this._midnightTimer.unref) this._midnightTimer.unref();
   }
 
