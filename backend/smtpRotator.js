@@ -18,6 +18,14 @@ import nodemailer from 'nodemailer';
 
 const PROVIDER_CONFIGS = [
   {
+    name:       'gmail_1',
+    host:       'smtp.gmail.com',
+    port:       587,
+    dailyLimit: 500,
+    userEnv:    'GMAIL_1_USER',
+    passEnv:    'GMAIL_1_PASS',
+  },
+  {
     name:       'brevo',
     host:       'smtp-relay.brevo.com',
     port:       587,
@@ -48,14 +56,6 @@ const PROVIDER_CONFIGS = [
     dailyLimit: 500,
     userEnv:    'SENDER_NET_USER',
     passEnv:    'SENDER_NET_PASS',
-  },
-  {
-    name:       'gmail_1',
-    host:       'smtp.gmail.com',
-    port:       587,
-    dailyLimit: 500,
-    userEnv:    'GMAIL_1_USER',
-    passEnv:    'GMAIL_1_PASS',
   },
   {
     name:       'gmail_2',
