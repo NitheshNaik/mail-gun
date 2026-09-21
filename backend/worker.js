@@ -125,9 +125,16 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function buildMailFactory(subject, template) {
   const fromName = process.env.SMTP_FROM_NAME || 'Bulk Mailer';
   const fromEmail = process.env.DEFAULT_FROM_EMAIL || process.env.SMTP_USER;
+  
+  // Convert all invisible newline characters from the frontend into HTML break tags
+  const formattedTemplate = template.trim().replace(/\n/g, '<br />');
+
   return (recipient) => {
     const name = capitalizeName(recipient.name);
-    const body = `Hi ${name} ${template.trim()}`;
+    
+    // Added a comma and two line breaks after the greeting so the main body starts on a new line
+    const body = `Hi ${name},<br /><br />${formattedTemplate}`;
+    
     return {
       from:    `"${fromName}" <${fromEmail}>`,
       to:      recipient.email,
