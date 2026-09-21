@@ -119,10 +119,10 @@ parallelRotator.printStats(); // show capacity on startup
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Build a mailFactory function for a given subject/template.
+ * Build a mailFactory function for a given subject/template (+ optional attachment).
  * Returns a function that takes a recipient and returns nodemailer mail options.
  */
-function buildMailFactory(subject, template) {
+function buildMailFactory(subject, template, attachmentPath, attachmentFilename) {
   const fromName = process.env.SMTP_FROM_NAME || 'Bulk Mailer';
   const fromEmail = process.env.DEFAULT_FROM_EMAIL || process.env.SMTP_USER;
   
@@ -133,14 +133,24 @@ function buildMailFactory(subject, template) {
     const name = capitalizeName(recipient.name);
     
     // Added a comma and two line breaks after the greeting so the main body starts on a new line
-    const body = `Hi ${name},<br /><br />${formattedTemplate}`;
+    const body = `Dear ${name} Hiring Team,<br /><br />${formattedTemplate}`;
     
-    return {
+    const mailOptions = {
       from:    `"${fromName}" <${fromEmail}>`,
       to:      recipient.email,
       subject: subject,
       html:    body,
     };
+
+    // Conditionally attach the file if one was provided with this job
+    if (attachmentPath && attachmentFilename) {
+      mailOptions.attachments = [{
+        filename: attachmentFilename,
+        path:     attachmentPath,
+      }];
+    }
+
+    return mailOptions;
   };
 }
 
@@ -164,7 +174,7 @@ console.log('\n[WORKER] Starting BullMQ worker subscription...');
 const worker = new Worker(
   'email-queue',
   async (job) => {
-    const { jobId, subject, template } = job.data;
+    const { jobId, subject, template, attachmentPath, attachmentFilename } = job.data;
 
     console.log(`\n==================================================`);
     console.log(`[JOB] Picked up job from queue: ${job.id}`);
@@ -226,8 +236,8 @@ const worker = new Worker(
         markTaskProcessing(task.id);
       }
 
-      // Build the mail factory function
-      const mailFactory = buildMailFactory(subject, template);
+      // Build the mail factory function (with optional attachment)
+      const mailFactory = buildMailFactory(subject, template, attachmentPath || null, attachmentFilename || null);
 
       // Track per-recipient task IDs (by email address, keyed for fast lookup)
       const taskByEmail = Object.fromEntries(tasks.map(t => [t.email, t]));

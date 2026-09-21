@@ -28,6 +28,7 @@ function App() {
   const [subject,         setSubject]         = useState('');
   const [templateMessage, setTemplateMessage] = useState('');
   const [isDragging,      setIsDragging]      = useState(false);
+  const [resumeFile,      setResumeFile]      = useState(null);
 
   // ── CSV preview ─────────────────────────────────────────────────────────────
   const [previewRows,    setPreviewRows]    = useState([]);
@@ -52,8 +53,9 @@ function App() {
   const [error,   setError]   = useState(null);
   const [success, setSuccess] = useState(null);
 
-  const fileInputRef = useRef(null);
-  const pollTimerRef = useRef(null);
+  const fileInputRef       = useRef(null);
+  const resumeFileInputRef = useRef(null);
+  const pollTimerRef       = useRef(null);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Polling
@@ -199,6 +201,16 @@ function App() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const handleResumeFileChange = (e) => {
+    const f = e.target.files[0];
+    setResumeFile(f || null);
+  };
+
+  const removeResumeFile = () => {
+    setResumeFile(null);
+    if (resumeFileInputRef.current) resumeFileInputRef.current.value = '';
+  };
+
   // ── Submit ─────────────────────────────────────────────────────────────────
   const handleSendEmails = async (e) => {
     e.preventDefault();
@@ -209,6 +221,7 @@ function App() {
     fd.append('file', file);
     fd.append('subject', subject.trim());
     fd.append('templateMessage', templateMessage.trim());
+    if (resumeFile) fd.append('resumeFile', resumeFile);
     try {
       const res  = await fetch(`${API_BASE}/api/upload-job`, { method: 'POST', body: fd });
       const data = await res.json();
@@ -230,11 +243,21 @@ function App() {
   const pendingCount = jobStatus?.pending ?? previewRows.length;
   const procCount    = jobStatus?.processing ?? 0;
 
+  /**
+   * Mirrors backend buildMailFactory exactly:
+   *   greeting: "Dear {name} Hiring Team,"
+   *   body: \n → <br />, prepended with two <br /> after greeting
+   */
+  function generatePreviewHtml(name, template) {
+    const safeName = name || 'John Doe';
+    const body = template.trim()
+      ? template.trim().replace(/\n/g, '<br />')
+      : '[Your message will appear here...]';
+    return `Dear ${safeName} Hiring Team,<br /><br />${body}`;
+  }
+
   const firstRecipient = previewRows.find(r => r.valid);
   const previewName    = firstRecipient?.name || 'John Doe';
-  const previewBody    = templateMessage.trim()
-    ? `Hi ${previewName} ${templateMessage.trim()}`
-    : `Hi ${previewName} [Your message will appear here...]`;
 
   const filteredRows = previewRows.filter(r => filter === 'all' || r.status === filter);
   const showControls = jobId && (
@@ -352,6 +375,47 @@ function App() {
               />
             </div>
 
+            {/* Attachment Upload */}
+            <div className="form-group">
+              <div className="form-label-row">
+                <label className="form-label" htmlFor="resume-file-input">ATTACHMENT <span style={{ color: 'var(--outline)', fontWeight: 400, fontSize: '0.75rem' }}>OPTIONAL</span></label>
+              </div>
+
+              {/* Always-mounted hidden input so the label's htmlFor is never orphaned */}
+              <input
+                id="resume-file-input"
+                type="file"
+                ref={resumeFileInputRef}
+                onChange={handleResumeFileChange}
+                style={{ display: 'none' }}
+                disabled={isBusy}
+              />
+
+              {!resumeFile ? (
+                <div
+                  className="attachment-dropzone"
+                  onClick={() => !isBusy && resumeFileInputRef.current?.click()}
+                  style={{ opacity: isBusy ? 0.5 : 1, cursor: isBusy ? 'not-allowed' : 'pointer' }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: '1.25rem', color: 'var(--outline)' }}>attach_file</span>
+                  <span style={{ color: 'var(--outline)', fontSize: '0.8rem' }}>Attach a file (PDF, DOCX…)</span>
+                </div>
+              ) : (
+                <div className="attachment-card">
+                  <span className="material-symbols-outlined" style={{ color: 'var(--color-primary)', fontSize: '1.1rem' }}>description</span>
+                  <span className="attachment-name" title={resumeFile.name}>{resumeFile.name}</span>
+                  <span className="attachment-size">{(resumeFile.size / 1024).toFixed(1)} KB</span>
+                  <button
+                    type="button"
+                    className="btn-remove"
+                    onClick={removeResumeFile}
+                    disabled={isBusy}
+                    title="Remove attachment"
+                  >✕</button>
+                </div>
+              )}
+            </div>
+
             {/* Live Preview */}
             <div className="form-group">
               <div className="preview-box">
@@ -359,7 +423,10 @@ function App() {
                   <span>To: {firstRecipient ? firstRecipient.email : 'example@domain.com'}</span>
                   <span>LIVE PREVIEW</span>
                 </div>
-                <div className="preview-body">{previewBody}</div>
+                <div
+                  className="preview-body"
+                  dangerouslySetInnerHTML={{ __html: generatePreviewHtml(previewName, templateMessage) }}
+                />
               </div>
             </div>
 

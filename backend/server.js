@@ -88,13 +88,20 @@ const storage = multer.diskStorage({
   filename:    (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
 });
 
+/** Accept any file for resumeFile; only CSV for csvFile / legacy 'file' field. */
+function csvOnlyFilter(req, file, cb) {
+  if (file.fieldname === 'resumeFile') {
+    // Allow any file type for the attachment
+    return cb(null, true);
+  }
+  const ok = /csv/.test(path.extname(file.originalname).toLowerCase()) ||
+             /csv/.test(file.mimetype);
+  ok ? cb(null, true) : cb(new Error('Only CSV files are allowed for the recipient list!'));
+}
+
 const upload = multer({
   storage,
-  fileFilter: (req, file, cb) => {
-    const ok = /csv/.test(path.extname(file.originalname).toLowerCase()) ||
-               /csv/.test(file.mimetype);
-    ok ? cb(null, true) : cb(new Error('Only CSV files are allowed!'));
-  },
+  fileFilter: csvOnlyFilter,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,15 +121,23 @@ function capitalizeName(name) {
 // Preview endpoint (unchanged from original) — loads CSV for table preview
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.post('/api/parse-csv', upload.single('file'), async (req, res) => {
+app.post('/api/parse-csv', upload.fields([
+  { name: 'file', maxCount: 1 }, 
+  { name: 'csvFile', maxCount: 1 }, 
+  { name: 'resumeFile', maxCount: 1 }
+]), async (req, res) => {
   try {
-    if (!req.file) {
+    // Support both legacy 'file' and new 'csvFile' field names
+    const csvUpload = (req.files['file'] && req.files['file'][0]) ||
+                      (req.files['csvFile'] && req.files['csvFile'][0]);
+
+    if (!csvUpload) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
     const rows = await new Promise((resolve, reject) => {
       const data = [];
-      fs.createReadStream(req.file.path)
+      fs.createReadStream(csvUpload.path)
         .pipe(csv())
         .on('data', row => {
           const clean = {};
@@ -133,7 +148,13 @@ app.post('/api/parse-csv', upload.single('file'), async (req, res) => {
         .on('error', reject);
     });
 
-    fs.unlinkSync(req.file.path);
+    // Clean up the uploaded CSV file
+    fs.unlinkSync(csvUpload.path);
+    
+    // Clean up the resume file if the frontend accidentally sent it to the parse route
+    if (req.files['resumeFile'] && req.files['resumeFile'][0]) {
+      fs.unlinkSync(req.files['resumeFile'][0].path);
+    }
 
     if (rows.length === 0) {
       return res.status(400).json({ error: 'CSV file is empty' });
@@ -150,7 +171,6 @@ app.post('/api/parse-csv', upload.single('file'), async (req, res) => {
       });
     }
 
-    // Return only a preview slice (max 200 rows) to keep response fast
     const preview = rows.slice(0, 200).map((row, index) => {
       const originalName = row[nameKey] ? row[nameKey].trim() : '';
       const email        = row[emailKey] ? row[emailKey].trim() : '';
@@ -185,18 +205,29 @@ app.post('/api/parse-csv', upload.single('file'), async (req, res) => {
 //  6. Returns { jobId } IMMEDIATELY — does not wait for sending
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.post('/api/upload-job', upload.single('file'), async (req, res) => {
+app.post('/api/upload-job', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'csvFile', maxCount: 1 }, { name: 'resumeFile', maxCount: 1 }]), async (req, res) => {
   const { subject, templateMessage } = req.body;
 
-  if (!req.file) {
+  // Support both legacy 'file' field name and explicit 'csvFile'
+  const csvUpload = (req.files['file'] && req.files['file'][0]) ||
+                    (req.files['csvFile'] && req.files['csvFile'][0]);
+
+  // Optional attachment
+  const resumeUpload = req.files['resumeFile'] && req.files['resumeFile'][0];
+  const attachmentPath     = resumeUpload ? resumeUpload.path         : null;
+  const attachmentFilename = resumeUpload ? resumeUpload.originalname : null;
+
+  if (!csvUpload) {
     return res.status(400).json({ error: 'No CSV file uploaded.' });
   }
   if (!subject || !subject.trim()) {
-    fs.unlinkSync(req.file.path);
+    fs.unlinkSync(csvUpload.path);
+    if (attachmentPath) fs.unlinkSync(attachmentPath);
     return res.status(400).json({ error: 'Email subject is required.' });
   }
   if (!templateMessage || !templateMessage.trim()) {
-    fs.unlinkSync(req.file.path);
+    fs.unlinkSync(csvUpload.path);
+    if (attachmentPath) fs.unlinkSync(attachmentPath);
     return res.status(400).json({ error: 'Message template is required.' });
   }
 
@@ -211,7 +242,7 @@ app.post('/api/upload-job', upload.single('file'), async (req, res) => {
   let   batchIndex    = 0;
   let   dbReady       = false;
 
-  const filePath = req.file.path;
+  const filePath = csvUpload.path;
 
   // Flush current chunk to SQLite + enqueue a BullMQ job
   async function flushChunk() {
@@ -231,8 +262,10 @@ app.post('/api/upload-job', upload.single('file'), async (req, res) => {
     // Enqueue one BullMQ job per batch — worker picks it up asynchronously
     await emailQueue.add(`batch-${jobId}-${batchIndex++}`, {
       jobId,
-      subject:  subject.trim(),
-      template: templateMessage.trim(),
+      subject:             subject.trim(),
+      template:            templateMessage.trim(),
+      attachmentPath,
+      attachmentFilename,
     });
   }
 
@@ -303,7 +336,7 @@ app.post('/api/upload-job', upload.single('file'), async (req, res) => {
     });
 
   } catch (error) {
-    // Clean up on error
+    // Clean up uploaded CSV on error (but keep attachment — it may be referenced by other batches)
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     console.error('[UPLOAD] Error processing CSV:', error);
     res.status(500).json({ error: error.message || 'Failed to process CSV.' });
@@ -519,8 +552,10 @@ app.post('/api/jobs/:jobId/resume', async (req, res) => {
     // 4. Re-enqueue a new BullMQ job with the remaining recipients only
     await emailQueue.add(`resume-${jobId}-${Date.now()}`, {
       jobId,
-      subject:  job.subject,
-      template: job.template,
+      subject:             job.subject,
+      template:            job.template,
+      attachmentPath:      job.attachmentPath      || null,
+      attachmentFilename:  job.attachmentFilename  || null,
       sentRecipients,
     });
 

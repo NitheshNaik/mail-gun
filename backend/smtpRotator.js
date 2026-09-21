@@ -499,7 +499,7 @@ export class ParallelSmtpRotator {
   }
 
   /**
-   * Split recipients into 4 equal chunks and send all groups concurrently.
+   * Split recipients into chunks based on ACTIVE groups, and send concurrently.
    *
    * @param {Array<{id,name,email}>} recipients
    * @param {(recipient) => object} mailFactory   — Returns nodemailer mail options
@@ -508,20 +508,31 @@ export class ParallelSmtpRotator {
    * @returns {Promise<{sent:number, failed:number, results:Array}>}
    */
   async sendBatch(recipients, mailFactory, onProgress = () => {}, signal = null) {
-    const chunkSize = Math.ceil(recipients.length / 4);
+    // 1. Filter out groups that have no active providers or are completely exhausted
+    const activeGroups = this._groups.filter(g => g.rotator.getTotalRemainingToday() > 0);
+
+    if (activeGroups.length === 0) {
+      throw new Error('All SMTP providers are exhausted or not configured.');
+    }
+
+    // 2. Divide recipients dynamically across ONLY the active groups
+    const numActive = activeGroups.length;
+    const chunkSize = Math.ceil(recipients.length / numActive);
     const chunks    = [];
-    for (let i = 0; i < 4; i++) {
+    
+    for (let i = 0; i < numActive; i++) {
       chunks.push(recipients.slice(i * chunkSize, (i + 1) * chunkSize));
     }
 
+    // 3. Dispatch the chunks to the active groups
     const groupResults = await Promise.allSettled(
-      this._groups.map((g, i) =>
+      activeGroups.map((g, i) =>
         this._sendChunk(g.groupNum, g.rotator, chunks[i] || [], mailFactory, onProgress, signal)
       )
     );
 
-    let sent    = 0;
-    let failed  = 0;
+    let sent   = 0;
+    let failed = 0;
     const results = [];
 
     for (const outcome of groupResults) {
